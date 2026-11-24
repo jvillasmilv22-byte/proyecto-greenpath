@@ -1,4 +1,5 @@
-from math import ceil, isfinite
+from collections import deque
+from math import ceil, hypot, isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Lock
@@ -20,15 +21,25 @@ MAX_BYTES_VIDEO = 50 * 1024 * 1024
 MAX_SEGUNDOS_VIDEO = 30
 TAMANO_BLOQUE = 1024 * 1024
 
-# Parámetros iniciales de visibilidad, pendientes de calibración.
+# Parámetros iniciales pendientes de calibración.
 BRILLO_MINIMO = 15
 BRILLO_MAXIMO = 245
 CONTRASTE_MINIMO = 5
+TIEMPO_MINIMO_TRAYECTORIA = 0.5
+FRACCION_MINIMA_MOVIMIENTO = 0.01
+
+DIRECCIONES = (
+    "HACIA ARRIBA",
+    "HACIA ABAJO",
+    "HACIA IZQUIERDA",
+    "HACIA DERECHA",
+    "MOVIMIENTO INSUFICIENTE",
+    "SIN TRAYECTORIA SUFICIENTE",
+)
 
 
 def evaluar_visibilidad(imagen):
     gris = cv2.cvtColor(imagen, cv2.COLOR_BGR2GRAY)
-
     brillo_promedio = float(np.mean(gris))
     contraste = float(np.std(gris))
 
@@ -65,11 +76,7 @@ def analizar_fotograma(imagen):
     )
 
     porcentaje = conteo / CAPACIDAD_MAXIMA * 100
-    estado = (
-        "EVITAR"
-        if porcentaje >= UMBRAL_CONGESTION
-        else "ACCESIBLE"
-    )
+    estado = "EVITAR" if porcentaje >= UMBRAL_CONGESTION else "ACCESIBLE"
 
     return {
         "vehiculos_detectados": conteo,
@@ -77,6 +84,58 @@ def analizar_fotograma(imagen):
         "estado_ruta": estado,
         "motivo": "Clasificación según el conteo y el umbral del prototipo",
     }
+
+
+def obtener_movimiento(caja, indice, fps, historial, ancho, alto):
+    if caja.id is None:
+        return None, "SIN TRAYECTORIA SUFICIENTE"
+
+    identificador = int(caja.id.item())
+    x1, y1, x2, y2 = caja.xyxy[0].tolist()
+    centro_x = (x1 + x2) / 2
+    centro_y = (y1 + y2) / 2
+
+    trayectoria = historial.setdefault(identificador, deque())
+
+    # Reinicia la observación si el vehículo estuvo ausente.
+    if trayectoria:
+        ausencia = indice - trayectoria[-1][0]
+        if ausencia > max(2, round(fps * 0.2)):
+            trayectoria.clear()
+
+    trayectoria.append((indice, centro_x, centro_y))
+
+    # Conserva aproximadamente el último segundo.
+    while len(trayectoria) > 1 and indice - trayectoria[0][0] > fps:
+        trayectoria.popleft()
+
+    primer_indice, primer_x, primer_y = trayectoria[0]
+    tiempo_observado = (indice - primer_indice) / fps
+
+    if tiempo_observado < TIEMPO_MINIMO_TRAYECTORIA:
+        return identificador, "SIN TRAYECTORIA SUFICIENTE"
+
+    desplazamiento_x = centro_x - primer_x
+    desplazamiento_y = centro_y - primer_y
+    umbral = hypot(ancho, alto) * FRACCION_MINIMA_MOVIMIENTO
+
+    if hypot(desplazamiento_x, desplazamiento_y) < umbral:
+        return identificador, "MOVIMIENTO INSUFICIENTE"
+
+    if abs(desplazamiento_y) >= abs(desplazamiento_x):
+        direccion = (
+            "HACIA ABAJO"
+            if desplazamiento_y > 0
+            else "HACIA ARRIBA"
+        )
+    else:
+        direccion = (
+            "HACIA DERECHA"
+            if desplazamiento_x > 0
+            else "HACIA IZQUIERDA"
+        )
+
+    return identificador, direccion
 
 
 @app.post("/analizar-ruta")
@@ -110,9 +169,7 @@ def analizar_ruta(file: UploadFile = File(...)):
 
 @app.post("/analizar-video")
 def analizar_video(file: UploadFile = File(...)):
-    extension = Path(file.filename or "").suffix.lower()
-
-    if extension != ".mp4":
+    if Path(file.filename or "").suffix.lower() != ".mp4":
         raise HTTPException(
             status_code=400,
             detail="Sube un archivo MP4",
@@ -120,6 +177,7 @@ def analizar_video(file: UploadFile = File(...)):
 
     muestras = []
     bytes_recibidos = 0
+    fotogramas_procesados = 0
 
     with TemporaryDirectory() as carpeta:
         ruta_video = Path(carpeta) / "entrada.mp4"
@@ -159,29 +217,107 @@ def analizar_video(file: UploadFile = File(...)):
                     detail="No se pudo determinar el FPS del video",
                 )
 
-            # Selecciona aproximadamente un fotograma por segundo.
+            # Modelo independiente para cada solicitud de video.
+            modelo_video = YOLO("yolov8n.pt")
+            historial = {}
+
             indices_muestra = {
                 round(segundo * fps)
                 for segundo in range(MAX_SEGUNDOS_VIDEO)
             }
-
             limite_fotogramas = ceil(fps * MAX_SEGUNDOS_VIDEO)
 
             for indice in range(limite_fotogramas):
-                if indice not in indices_muestra:
-                    if not captura.grab():
-                        break
-                    continue
-
                 leido, fotograma = captura.read()
 
                 if not leido:
                     break
 
-                muestras.append({
-                    "segundo": round(indice / fps, 2),
-                    **analizar_fotograma(fotograma),
-                })
+                fotogramas_procesados += 1
+                motivo = evaluar_visibilidad(fotograma)
+
+                if motivo is not None:
+                    historial.clear()
+
+                    predictor = modelo_video.predictor
+                    for tracker in getattr(predictor, "trackers", []):
+                        tracker.reset()
+
+                    if indice in indices_muestra:
+                        muestras.append({
+                            "segundo": round(indice / fps, 2),
+                            "vehiculos_detectados": None,
+                            "porcentaje_congestion": None,
+                            "estado_ruta": "NO EVALUABLE",
+                            "motivo": motivo,
+                            "movimientos": None,
+                            "vehiculos": [],
+                        })
+
+                    continue
+
+                # El seguimiento procesa fotogramas consecutivos.
+                resultado = modelo_video.track(
+                    fotograma,
+                    persist=True,
+                    tracker="bytetrack.yaml",
+                    classes=sorted(CLASES_VEHICULOS),
+                    conf=0.25,
+                    verbose=False,
+                )[0]
+
+                alto, ancho = fotograma.shape[:2]
+                movimientos = dict.fromkeys(DIRECCIONES, 0)
+                vehiculos = []
+
+                for caja in resultado.boxes:
+                    identificador, direccion = obtener_movimiento(
+                        caja,
+                        indice,
+                        fps,
+                        historial,
+                        ancho,
+                        alto,
+                    )
+
+                    movimientos[direccion] += 1
+                    vehiculos.append({
+                        "id": identificador,
+                        "clase": resultado.names[int(caja.cls.item())],
+                        "movimiento": direccion,
+                    })
+
+                caducados = [
+                    identificador
+                    for identificador, trayectoria in historial.items()
+                    if indice - trayectoria[-1][0] > fps * 2
+                ]
+
+                for identificador in caducados:
+                    del historial[identificador]
+
+                # Devuelve aproximadamente una muestra por segundo.
+                if indice in indices_muestra:
+                    conteo = len(vehiculos)
+                    porcentaje = conteo / CAPACIDAD_MAXIMA * 100
+                    estado = (
+                        "EVITAR"
+                        if porcentaje >= UMBRAL_CONGESTION
+                        else "ACCESIBLE"
+                    )
+
+                    muestras.append({
+                        "segundo": round(indice / fps, 2),
+                        "vehiculos_detectados": conteo,
+                        "porcentaje_congestion": round(porcentaje, 2),
+                        "estado_ruta": estado,
+                        "motivo": (
+                            "Clasificación según el conteo "
+                            "y el umbral del prototipo"
+                        ),
+                        "movimientos": movimientos,
+                        "vehiculos": vehiculos,
+                    })
 
         finally:
             captura.release()
@@ -194,5 +330,10 @@ def analizar_video(file: UploadFile = File(...)):
 
     return {
         "fotogramas_analizados": len(muestras),
+        "fotogramas_procesados": fotogramas_procesados,
+        "descripcion": (
+            "Muestras aproximadamente por segundo y movimiento "
+            "respecto de una cámara fija"
+        ),
         "muestras": muestras,
     }
